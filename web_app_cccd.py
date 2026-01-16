@@ -4,7 +4,7 @@ import cv2
 import numpy as np
 from rembg import remove, new_session
 import io
-import gc # Garbage Collector để dọn rác bộ nhớ
+import gc # Thư viện dọn rác bộ nhớ
 
 # --- CẤU HÌNH ---
 st.set_page_config(page_title="Tool Ghép CCCD V5 (Lite)", page_icon="🆔", layout="centered")
@@ -14,6 +14,7 @@ st.set_page_config(page_title="Tool Ghép CCCD V5 (Lite)", page_icon="🆔", lay
 @st.cache_resource
 def load_ai_session():
     # QUAN TRỌNG: Dùng 'u2netp' (bản nhẹ) thay vì 'u2net' để tránh sập server
+    # Model này chỉ nặng 4MB so với 176MB của bản gốc
     return new_session("u2netp")
 
 def pixel_from_mm(mm, dpi=300):
@@ -34,7 +35,7 @@ def smart_scan_v5(image_pil, session):
     """
     V5: Resize trước khi xử lý + Bào mòn mask để chống nghiêng
     """
-    # 1. Resize ảnh đầu vào nếu quá lớn (Giảm tải RAM)
+    # 1. Resize ảnh đầu vào nếu quá lớn (Giảm tải RAM cực mạnh)
     max_size = 1500
     w, h = image_pil.size
     if max(w, h) > max_size:
@@ -46,12 +47,12 @@ def smart_scan_v5(image_pil, session):
     
     try:
         # 2. Lấy Mask (Dùng model nhẹ u2netp)
-        # Chỉ lấy mask đen trắng để tiết kiệm mem
+        # Chỉ lấy mask đen trắng
         mask_pil = remove(image_pil, session=session, only_mask=True)
         mask = np.array(mask_pil)
         
-        # 3. KỸ THUẬT MỚI: Bào mòn (Erosion) để loại bỏ bóng mờ/viền răng cưa
-        # Giúp contour bám chặt vào mép cứng của thẻ -> Góc xoay chuẩn hơn
+        # 3. KỸ THUẬT MỚI: Bào mòn (Erosion)
+        # Loại bỏ bóng mờ/viền răng cưa -> Giúp khung bao ôm sát thẻ thật
         kernel = np.ones((5,5), np.uint8)
         mask = cv2.erode(mask, kernel, iterations=2)
         
@@ -67,19 +68,18 @@ def smart_scan_v5(image_pil, session):
         box = np.int0(box)
         
         # 6. Ép phẳng (Perspective Transform)
-        dst_w, dst_h = 1011, 638 # Chuẩn pixel
+        dst_w, dst_h = 1011, 638 # Chuẩn pixel scan
         rect_pts = order_points(box)
         dst_pts = np.array([[0, 0], [dst_w-1, 0], [dst_w-1, dst_h-1], [0, dst_h-1]], dtype="float32")
         
         M = cv2.getPerspectiveTransform(rect_pts, dst_pts)
         
         # Cắt từ ảnh gốc (để giữ màu sắc đẹp nhất)
-        # Lưu ý: Cắt xong mới xóa nền lần cuối để viền đẹp
         warped = cv2.warpPerspective(img_np, M, (dst_w, dst_h), flags=cv2.INTER_LANCZOS4)
         
-        # Xóa nền lần cuối trên ảnh đã cắt phẳng (nhanh vì ảnh nhỏ)
+        # Xóa nền lần cuối trên ảnh đã cắt phẳng (lúc này ảnh nhỏ nên xử lý rất nhanh)
         warped_pil = Image.fromarray(warped)
-        final_clean = remove(warped_pil, session=session) # Xóa nền đen 4 góc
+        final_clean = remove(warped_pil, session=session) 
         
         return final_clean
 
@@ -91,8 +91,9 @@ def smart_scan_v5(image_pil, session):
 
 def main():
     st.markdown("<h1 style='text-align: center; color: #8e44ad;'>🆔 TOOL V5 (LITE & SHARP)</h1>", unsafe_allow_html=True)
+    st.caption("Phiên bản tối ưu bộ nhớ & Chống nghiêng")
     
-    use_ai = st.checkbox("Bật AI (Chế độ tiết kiệm RAM)", value=True)
+    use_ai = st.checkbox("Bật AI (Chế độ Lite)", value=True)
     
     session = None
     if use_ai:
@@ -109,7 +110,7 @@ def main():
                 # Dọn rác bộ nhớ trước khi chạy
                 gc.collect()
                 
-                with st.spinner("Đang xử lý..."):
+                with st.spinner("Đang xử lý (Siêu tốc)..."):
                     img1 = Image.open(f_file)
                     img2 = Image.open(b_file)
 
@@ -142,8 +143,8 @@ def main():
                     
                     st.download_button("📥 TẢI PDF", pdf_buffer.getvalue(), "CCCD_V5.pdf", "application/pdf", type="primary")
                     
-                    # Dọn rác sau khi chạy
-                    del scan1, scan2, canvas
+                    # Giải phóng bộ nhớ ngay lập tức
+                    del scan1, scan2, canvas, img1, img2
                     gc.collect()
 
             except Exception as e:
