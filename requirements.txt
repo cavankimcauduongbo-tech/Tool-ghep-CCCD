@@ -1,7 +1,7 @@
-streamlit
+streamlit==1.29.0
+streamlit-drawable-canvas
 rembg[cpu]
 opencv-python-headless
 numpy
 pillow
 onnxruntime
-streamlit-drawable-canvas
