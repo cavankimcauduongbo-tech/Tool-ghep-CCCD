@@ -1,30 +1,28 @@
 import streamlit as st
-from PIL import Image, ImageEnhance
+from PIL import Image
 import cv2
 import numpy as np
 from rembg import remove, new_session
 import io
-import gc
 
-# --- CẤU HÌNH ---
-st.set_page_config(page_title="Tool CCCD V8 (Chỉnh Nghiêng)", page_icon="🆔", layout="centered")
+# --- CẤU HÌNH TRANG WEB ---
+st.set_page_config(
+    page_title="Tool Ghép CCCD - Kim ATP",
+    page_icon="🆔",
+    layout="centered"
+)
 
-# --- CORE LOGIC ---
+# --- 1. LOGIC XỬ LÝ ẢNH (GIỮ NGUYÊN TỪ BẢN DESKTOP) ---
 
 @st.cache_resource
 def load_ai_session():
-    return new_session("u2netp")
+    """Load model AI một lần duy nhất để web chạy nhanh"""
+    return new_session("u2net")
 
-def enhance_image(image_pil):
-    """Tăng tương phản để AI dễ tách nền bàn gỗ hơn"""
-    enhancer = ImageEnhance.Contrast(image_pil)
-    image_pil = enhancer.enhance(1.5) # Tăng 50% tương phản
-    enhancer_sharp = ImageEnhance.Sharpness(image_pil)
-    image_pil = enhancer_sharp.enhance(2.0) # Tăng độ nét
-    return image_pil
+def pixel_from_mm(mm, dpi=300):
+    return int(mm * dpi / 25.4)
 
 def order_points(pts):
-    """Sắp xếp 4 điểm: TL, TR, BR, BL"""
     rect = np.zeros((4, 2), dtype="float32")
     s = pts.sum(axis=1)
     rect[0] = pts[np.argmin(s)]
@@ -34,175 +32,139 @@ def order_points(pts):
     rect[3] = pts[np.argmax(diff)]
     return rect
 
-def rotate_image(image, angle):
-    """Xoay ảnh thủ công để sửa nghiêng"""
-    if angle == 0: return image
-    # Dùng Bicubic để giữ nét khi xoay
-    return image.rotate(angle, resample=Image.Resampling.BICUBIC, expand=True, fillcolor=(255,255,255))
+def four_point_transform(image, pts):
+    rect = order_points(pts)
+    (tl, tr, br, bl) = rect
+    widthA = np.sqrt(((br[0] - bl[0]) ** 2) + ((br[1] - bl[1]) ** 2))
+    widthB = np.sqrt(((tr[0] - tl[0]) ** 2) + ((tr[1] - tl[1]) ** 2))
+    maxWidth = max(int(widthA), int(widthB))
+    heightA = np.sqrt(((tr[0] - br[0]) ** 2) + ((tr[1] - br[1]) ** 2))
+    heightB = np.sqrt(((tl[0] - bl[0]) ** 2) + ((tl[1] - bl[1]) ** 2))
+    maxHeight = max(int(heightA), int(heightB))
+    dst = np.array([[0, 0], [maxWidth - 1, 0], [maxWidth - 1, maxHeight - 1], [0, maxHeight - 1]], dtype="float32")
+    M = cv2.getPerspectiveTransform(rect, dst)
+    return cv2.warpPerspective(image, M, (maxWidth, maxHeight))
 
-def smart_scan_v8(image_pil, session, shave_w=15, shave_h=5):
-    # 1. Chuẩn hóa & Tăng tương phản đầu vào
-    image_pil = image_pil.convert("RGB")
+def process_card_image(uploaded_file, use_ai, session):
+    # Đọc ảnh từ file upload
+    file_bytes = np.asarray(bytearray(uploaded_file.read()), dtype=np.uint8)
+    img_cv = cv2.imdecode(file_bytes, 1)
     
-    # Resize
-    max_size = 1500
-    w_orig, h_orig = image_pil.size
-    scale_ratio = 1.0
-    if max(w_orig, h_orig) > max_size:
-        scale_ratio = max_size / max(w_orig, h_orig)
-        new_size = (int(w_orig * scale_ratio), int(h_orig * scale_ratio))
-        image_pil_resized = image_pil.resize(new_size, Image.Resampling.LANCZOS)
-    else:
-        image_pil_resized = image_pil
+    orig = img_cv.copy()
+    img_rgb = cv2.cvtColor(img_cv, cv2.COLOR_BGR2RGB)
 
-    # Tạo bản copy đã tăng tương phản để đưa vào AI (giúp tách nền tốt hơn)
-    img_for_ai = enhance_image(image_pil_resized)
-    img_np_resized = np.array(img_for_ai)
-    
-    try:
-        # 2. Lấy Mask
-        mask_pil = remove(img_for_ai, session=session, only_mask=True)
-        mask = np.array(mask_pil)
-        
-        # 3. Tìm Contour
-        cnts, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        if not cnts: return image_pil
-        c = max(cnts, key=cv2.contourArea)
-        
-        # 4. THUẬT TOÁN MỚI: ApproxPolyDP (Bắt đa giác 4 cạnh)
-        # Cách này chuẩn hơn minAreaRect khi gặp viền bo tròn hoặc bóng
-        peri = cv2.arcLength(c, True)
-        approx = cv2.approxPolyDP(c, 0.02 * peri, True)
-        
-        if len(approx) == 4:
-            # Nếu tìm được đúng 4 góc -> Quá tuyệt
-            box = approx.reshape(4, 2)
-        else:
-            # Nếu không (do bóng làm méo), quay về cách cũ
-            rect = cv2.minAreaRect(c)
-            box = cv2.boxPoints(rect)
+    if use_ai:
+        try:
+            no_bg_image = remove(img_rgb, session=session)
+            alpha_channel = no_bg_image[:, :, 3]
+            cnts, _ = cv2.findContours(alpha_channel, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            cnts = sorted(cnts, key=cv2.contourArea, reverse=True)[:1]
             
-        box = box.astype(int)
-        
-        # 5. Quy đổi về ảnh gốc
-        if scale_ratio != 1.0:
-            box = (box / scale_ratio).astype(int)
-            img_np_final = np.array(image_pil)
-        else:
-            img_np_final = np.array(image_pil)
+            screenCnt = None
+            for c in cnts:
+                peri = cv2.arcLength(c, True)
+                approx = cv2.approxPolyDP(c, 0.02 * peri, True)
+                if len(approx) == 4:
+                    screenCnt = approx
+                    break
+            
+            if screenCnt is not None:
+                warped = four_point_transform(orig, screenCnt.reshape(4, 2))
+                return Image.fromarray(cv2.cvtColor(warped, cv2.COLOR_BGR2RGB))
+            elif len(cnts) > 0:
+                x, y, w, h = cv2.boundingRect(cnts[0])
+                crop = orig[y:y+h, x:x+w]
+                return Image.fromarray(cv2.cvtColor(crop, cv2.COLOR_BGR2RGB))
+        except Exception as e:
+            st.error(f"Lỗi AI: {e}")
+    
+    return Image.fromarray(img_rgb)
 
-        # 6. Ép phẳng
-        dst_w_raw, dst_h_raw = 1040, 660 
-        rect_pts = order_points(box)
-        
-        # Logic xoay ngang
-        width_check = np.linalg.norm(rect_pts[0] - rect_pts[1])
-        height_check = np.linalg.norm(rect_pts[0] - rect_pts[3])
-        if height_check > width_check:
-             rect_pts = np.array([rect_pts[3], rect_pts[0], rect_pts[1], rect_pts[2]], dtype="float32")
-
-        dst_pts = np.array([[0, 0], [dst_w_raw-1, 0], [dst_w_raw-1, dst_h_raw-1], [0, dst_h_raw-1]], dtype="float32")
-        
-        M = cv2.getPerspectiveTransform(rect_pts, dst_pts)
-        warped = cv2.warpPerspective(img_np_final, M, (dst_w_raw, dst_h_raw), flags=cv2.INTER_LANCZOS4)
-        
-        # Cắt gọt viền
-        h_warped, w_warped = warped.shape[:2]
-        if w_warped > 2*shave_w and h_warped > 2*shave_h:
-            warped_shaved = warped[shave_h:h_warped-shave_h, shave_w:w_warped-shave_w]
-            return Image.fromarray(warped_shaved)
-        else:
-            return Image.fromarray(warped)
-
-    except Exception as e:
-        st.warning(f"Lỗi AI: {e}")
-        return image_pil
-
-# --- GIAO DIỆN WEB ---
+# --- 2. GIAO DIỆN WEB (STREAMLIT UI) ---
 
 def main():
-    st.markdown("<h1 style='text-align: center; color: #2c3e50;'>🆔 TOOL V8 (CHỈNH NGHIÊNG)</h1>", unsafe_allow_html=True)
-    st.caption("AI + Chỉnh tay thủ công cho ca khó")
+    # Tiêu đề
+    st.markdown("<h1 style='text-align: center; color: #0078D7;'>🆔 TOOL GHÉP CCCD ONLINE</h1>", unsafe_allow_html=True)
+    st.markdown("<p style='text-align: center;'>Tự động tách nền, cắt góc và ghép vào khổ A4</p>", unsafe_allow_html=True)
     
-    # --- KHU VỰC ĐIỀU KHIỂN ---
-    st.markdown("### 🛠️ Bộ điều khiển")
+    # Sidebar cấu hình
+    st.sidebar.header("Cài đặt")
+    use_ai = st.sidebar.checkbox("Sử dụng AI Tách nền", value=True)
+    st.sidebar.info("Nếu ảnh chụp đã cắt sẵn, hãy bỏ chọn AI để chạy nhanh hơn.")
     
-    c1, c2 = st.columns(2)
-    with c1:
-        shave_w = st.slider("Gọt viền Trái/Phải (px)", 0, 40, 20)
-    with c2:
-        shave_h = st.slider("Gọt viền Trên/Dưới (px)", 0, 30, 5)
-        
-    st.markdown("---")
-    st.markdown("**🔄 Chỉnh nghiêng thủ công (Nếu AI bị lệch):**")
-    r1, r2 = st.columns(2)
-    with r1:
-        rot_f = st.slider("Xoay Mặt Trước (Độ)", -10.0, 10.0, 0.0, 0.5)
-    with r2:
-        rot_b = st.slider("Xoay Mặt Sau (Độ)", -10.0, 10.0, 0.0, 0.5)
-    
-    use_ai = st.checkbox("Bật AI Scan", value=True)
-    
+    # Load AI Session
     session = None
     if use_ai:
-        with st.spinner("Đang tải AI..."):
+        with st.spinner("Đang khởi động AI..."):
             session = load_ai_session()
 
-    # Upload
+    # Upload file
     col1, col2 = st.columns(2)
-    with col1: f_file = st.file_uploader("Mặt Trước", type=['jpg','png','jpeg'], key="f")
-    with col2: b_file = st.file_uploader("Mặt Sau", type=['jpg','png','jpeg'], key="b")
+    with col1:
+        st.subheader("1. Mặt Trước")
+        front_file = st.file_uploader("Chọn ảnh mặt trước", type=['jpg', 'png', 'jpeg'], key="front")
+    
+    with col2:
+        st.subheader("2. Mặt Sau")
+        back_file = st.file_uploader("Chọn ảnh mặt sau", type=['jpg', 'png', 'jpeg'], key="back")
 
-    if f_file and b_file:
-        if st.button("🚀 XỬ LÝ NGAY", type="primary", use_container_width=True):
+    # Nút xử lý
+    if front_file and back_file:
+        if st.button("🚀 BẮT ĐẦU XỬ LÝ NGAY", type="primary", use_container_width=True):
             try:
-                gc.collect()
-                with st.spinner("Đang xử lý..."):
-                    img1 = Image.open(f_file)
-                    img2 = Image.open(b_file)
+                with st.spinner("Đang xử lý ảnh... Vui lòng đợi..."):
+                    # Xử lý 2 ảnh
+                    img1 = process_card_image(front_file, use_ai, session)
+                    img2 = process_card_image(back_file, use_ai, session)
 
-                    if use_ai:
-                        # Scan bằng AI
-                        scan1 = smart_scan_v8(img1, session, shave_w=shave_w, shave_h=shave_h)
-                        scan2 = smart_scan_v8(img2, session, shave_w=shave_w, shave_h=shave_h)
-                    else:
-                        scan1, scan2 = img1, img2
-                    
-                    # --- BƯỚC MỚI: ÁP DỤNG XOAY THỦ CÔNG ---
-                    if rot_f != 0: scan1 = rotate_image(scan1, rot_f)
-                    if rot_b != 0: scan2 = rotate_image(scan2, rot_b)
+                    # Thông số A4
+                    DPI = 300
+                    A4_W, A4_H = pixel_from_mm(210, DPI), pixel_from_mm(297, DPI)
+                    C_W, C_H = pixel_from_mm(85.6, DPI), pixel_from_mm(53.98, DPI)
 
-                    # Ghép A4
-                    A4_W, A4_H = 2480, 3508
-                    target_w, target_h = 1011, 638
-                    
-                    scan1 = scan1.resize((target_w, target_h), Image.Resampling.LANCZOS)
-                    scan2 = scan2.resize((target_w, target_h), Image.Resampling.LANCZOS)
+                    # Resize
+                    img1 = img1.resize((C_W, C_H), Image.Resampling.LANCZOS)
+                    img2 = img2.resize((C_W, C_H), Image.Resampling.LANCZOS)
 
+                    # Tạo Canvas
                     canvas = Image.new('RGB', (A4_W, A4_H), 'white')
                     cx = A4_W // 2
-                    gap = 300
-                    sy = (A4_H - (target_h * 2 + gap)) // 2 
+                    sy = (A4_H - (C_H * 2 + 150)) // 2 
 
-                    canvas.paste(scan1, (cx - target_w // 2, sy))
-                    canvas.paste(scan2, (cx - target_w // 2, sy + target_h + gap))
+                    canvas.paste(img1, (cx - C_W // 2, sy))
+                    canvas.paste(img2, (cx - C_W // 2, sy + C_H + 150))
 
-                    st.success("Xong!")
-                    st.image(canvas, caption=f"Đã gọt {shave_w}px | Xoay {rot_f}° / {rot_b}°", use_container_width=True)
+                    # Hiển thị kết quả Preview (Resize nhỏ để xem trên web)
+                    st.success("Đã xử lý xong!")
+                    st.image(canvas, caption="Kết quả xem trước (Ảnh gốc tải về sẽ nét 100%)", use_container_width=True)
 
+                    # Lưu vào bộ nhớ đệm để tải xuống
                     pdf_buffer = io.BytesIO()
                     canvas.save(pdf_buffer, "PDF", resolution=300.0)
-                    
-                    st.download_button("📥 TẢI PDF", pdf_buffer.getvalue(), "CCCD_V8_Pro.pdf", "application/pdf", type="primary")
-                    
-                    del scan1, scan2, canvas, img1, img2
-                    gc.collect()
+                    pdf_bytes = pdf_buffer.getvalue()
+
+                    # Nút tải xuống
+                    st.download_button(
+                        label="📥 TẢI VỀ FILE PDF (Chuẩn in ấn)",
+                        data=pdf_bytes,
+                        file_name="CCCD_Ghep_KimATP.pdf",
+                        mime="application/pdf",
+                        type="primary"
+                    )
 
             except Exception as e:
-                st.error(f"Lỗi: {e}")
-
+                st.error(f"Có lỗi xảy ra: {str(e)}")
+    
+    # --- FOOTER ---
     st.markdown("---")
-    st.markdown("<div style='text-align: center; color: grey;'>App created by Cà Văn Kim - ATP</div>", unsafe_allow_html=True)
+    st.markdown(
+        """
+        <div style='text-align: center; color: white; background-color: #052c52; padding: 10px; border-radius: 5px;'>
+            <b>App created by Cà Văn Kim - ATP</b>
+        </div>
+        """, 
+        unsafe_allow_html=True
+    )
 
 if __name__ == "__main__":
     main()
